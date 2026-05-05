@@ -1,5 +1,5 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { Check, Copy, Plus } from "lucide-react";
+import { Check, Copy, Plus, RotateCcw, Trash2 } from "lucide-react";
 import { useState } from "react";
 import { useNavigate } from "react-router-dom";
 
@@ -9,7 +9,8 @@ import { GlassCard } from "@/components/molecules/GlassCard";
 import { Modal } from "@/components/molecules/Modal";
 import { useT } from "@/i18n";
 import { api, type DeploymentRead } from "@/lib/api/client";
-import { formatRelative } from "@/lib/format";
+import { cn } from "@/lib/cn";
+import { formatBytes, formatRelative } from "@/lib/format";
 
 function mapStatus(status: DeploymentRead["status"]): RunStatus {
   switch (status) {
@@ -25,6 +26,7 @@ function mapStatus(status: DeploymentRead["status"]): RunStatus {
     case "stopping":
     case "stopped":
     case "tearing_down":
+    case "trashed":
       return "cancelled";
     default:
       return "queued";
@@ -154,14 +156,88 @@ function NewDeploymentForm({ onClose }: { onClose: () => void }) {
   );
 }
 
+function TrashRow({ d }: { d: DeploymentRead }) {
+  const qc = useQueryClient();
+  const restore = useMutation({
+    mutationFn: () => api.deployments.restore(d.id),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ["deployments"] }),
+  });
+  const purge = useMutation({
+    mutationFn: () => api.deployments.purge(d.id),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ["deployments"] }),
+  });
+  const onPurge = (ev: React.MouseEvent) => {
+    ev.stopPropagation();
+    const size = formatBytes(d.disk_bytes ?? 0);
+    if (
+      confirm(
+        `Delete "${d.name}" forever? This wipes the staged artifacts (${size}) and the database row. Cannot be undone.`,
+      )
+    ) {
+      purge.mutate();
+    }
+  };
+  const onRestore = (ev: React.MouseEvent) => {
+    ev.stopPropagation();
+    restore.mutate();
+  };
+  return (
+    <tr key={d.id} className="hover:bg-bg-muted/60">
+      <td className="px-6 py-3 font-medium text-fg1">{d.name}</td>
+      <td className="px-6 py-3 text-xs text-fg2">{formatRelative(d.trashed_at)}</td>
+      <td className="px-6 py-3 text-xs font-mono text-fg2">
+        {formatBytes(d.disk_bytes ?? 0)}
+      </td>
+      <td className="px-6 py-3">
+        <div className="flex items-center justify-end gap-2">
+          <button
+            type="button"
+            onClick={onRestore}
+            disabled={restore.isPending}
+            className="inline-flex items-center gap-1.5 rounded-md border border-[color:var(--border)] bg-bg px-2.5 py-1 text-xs font-semibold text-fg1 transition hover:border-primary hover:bg-[color:var(--primary-soft)] disabled:opacity-50"
+            title="Re-deploy this model from the same staged artifacts"
+          >
+            <RotateCcw size={13} strokeWidth={2} />
+            {restore.isPending ? "Restoring…" : "Restore"}
+          </button>
+          <button
+            type="button"
+            onClick={onPurge}
+            disabled={purge.isPending}
+            className="inline-flex items-center gap-1.5 rounded-md border border-[color:var(--border)] bg-bg px-2.5 py-1 text-xs font-semibold text-danger transition hover:border-danger hover:bg-[color:var(--danger-soft,rgba(255,90,90,0.08))] disabled:opacity-50"
+            title="Permanently delete the staged artifacts and DB row"
+          >
+            <Trash2 size={13} strokeWidth={2} />
+            {purge.isPending ? "Deleting…" : "Delete forever"}
+          </button>
+        </div>
+      </td>
+    </tr>
+  );
+}
+
 export function DeploymentsList() {
   const t = useT();
   const navigate = useNavigate();
   const [newOpen, setNewOpen] = useState(false);
-  const deployments = useQuery({
-    queryKey: ["deployments"],
-    queryFn: () => api.deployments.list(),
+  const [view, setView] = useState<"active" | "trash">("active");
+
+  const active = useQuery({
+    queryKey: ["deployments", { trashed: false }],
+    queryFn: () => api.deployments.list({ trashed: false }),
   });
+  const trashed = useQuery({
+    queryKey: ["deployments", { trashed: true }],
+    queryFn: () => api.deployments.list({ trashed: true }),
+  });
+
+  const trashCount = trashed.data?.length ?? 0;
+  const trashBytes = (trashed.data ?? []).reduce(
+    (sum, d) => sum + (d.disk_bytes ?? 0),
+    0,
+  );
+
+  const visible = view === "active" ? active : trashed;
 
   return (
     <div className="mx-auto flex max-w-6xl flex-col gap-6">
@@ -177,14 +253,53 @@ export function DeploymentsList() {
         </Button>
       </header>
 
+      <div role="tablist" className="flex items-center gap-1 border-b border-[color:var(--border)]">
+        <button
+          type="button"
+          role="tab"
+          aria-selected={view === "active"}
+          onClick={() => setView("active")}
+          className={cn(
+            "border-b-2 px-4 py-2 text-sm font-semibold transition-colors",
+            view === "active"
+              ? "border-primary text-primary"
+              : "border-transparent text-fg2 hover:text-fg1",
+          )}
+        >
+          Active
+        </button>
+        <button
+          type="button"
+          role="tab"
+          aria-selected={view === "trash"}
+          onClick={() => setView("trash")}
+          className={cn(
+            "inline-flex items-center gap-2 border-b-2 px-4 py-2 text-sm font-semibold transition-colors",
+            view === "trash"
+              ? "border-primary text-primary"
+              : "border-transparent text-fg2 hover:text-fg1",
+          )}
+        >
+          <Trash2 size={14} strokeWidth={2} />
+          Trash
+          {trashCount > 0 ? (
+            <span className="inline-flex items-center rounded-pill bg-bg-muted px-2 py-0.5 text-[11px] font-mono text-fg2">
+              {trashCount} · {formatBytes(trashBytes)}
+            </span>
+          ) : null}
+        </button>
+      </div>
+
       <GlassCard className="!p-0 overflow-hidden">
-        {deployments.isPending ? (
+        {visible.isPending ? (
           <div className="p-6 text-sm text-fg3">{t("common.loading")}…</div>
-        ) : deployments.isError ? (
+        ) : visible.isError ? (
           <div className="p-6 text-sm text-danger">{t("common.error")}</div>
-        ) : deployments.data.length === 0 ? (
-          <div className="p-8 text-center text-sm text-fg3">{t("deployments.empty")}</div>
-        ) : (
+        ) : (visible.data ?? []).length === 0 ? (
+          <div className="p-8 text-center text-sm text-fg3">
+            {view === "trash" ? "Trash is empty." : t("deployments.empty")}
+          </div>
+        ) : view === "active" ? (
           <table className="w-full border-collapse text-sm">
             <thead className="bg-bg-muted text-left">
               <tr>
@@ -203,7 +318,7 @@ export function DeploymentsList() {
               </tr>
             </thead>
             <tbody className="divide-y divide-[color:var(--border)]">
-              {deployments.data.map((d) => (
+              {(active.data ?? []).map((d) => (
                 <tr
                   key={d.id}
                   className="cursor-pointer hover:bg-bg-muted/60"
@@ -220,6 +335,30 @@ export function DeploymentsList() {
                     {formatRelative(d.last_called_at)}
                   </td>
                 </tr>
+              ))}
+            </tbody>
+          </table>
+        ) : (
+          <table className="w-full border-collapse text-sm">
+            <thead className="bg-bg-muted text-left">
+              <tr>
+                <th className="px-6 py-3 text-xs font-semibold uppercase tracking-[0.08em] text-fg2">
+                  Name
+                </th>
+                <th className="px-6 py-3 text-xs font-semibold uppercase tracking-[0.08em] text-fg2">
+                  Trashed
+                </th>
+                <th className="px-6 py-3 text-xs font-semibold uppercase tracking-[0.08em] text-fg2">
+                  Disk
+                </th>
+                <th className="px-6 py-3 text-right text-xs font-semibold uppercase tracking-[0.08em] text-fg2">
+                  Actions
+                </th>
+              </tr>
+            </thead>
+            <tbody className="divide-y divide-[color:var(--border)]">
+              {(trashed.data ?? []).map((d) => (
+                <TrashRow key={d.id} d={d} />
               ))}
             </tbody>
           </table>

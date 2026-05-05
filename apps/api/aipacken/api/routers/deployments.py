@@ -1,11 +1,14 @@
 from __future__ import annotations
 
 import re
+import shutil
 import uuid
-from datetime import UTC
+from datetime import UTC, datetime
+from pathlib import Path
 from typing import Any
 
 import httpx
+import structlog
 from fastapi import APIRouter, Depends, HTTPException, Response
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -30,8 +33,11 @@ from aipacken.db.models import Deployment, Run, User
 from aipacken.jobs.queue import enqueue
 from aipacken.services import mlflow_client
 from aipacken.services.auth import get_current_user
+from aipacken.services.redis_client import publish
 
 router = APIRouter(prefix="/deployments", tags=["deployments"])
+
+_log = structlog.get_logger(__name__)
 
 
 def _slugify(name: str) -> str:
@@ -39,10 +45,53 @@ def _slugify(name: str) -> str:
     return f"{s}-{uuid.uuid4().hex[:8]}" if s else f"model-{uuid.uuid4().hex[:8]}"
 
 
-def _to_read(dep: Deployment) -> DeploymentRead:
+def _dir_size_bytes(path: Path) -> int | None:
+    """Return the total bytes occupied by *path*, or None if missing.
+
+    Best-effort: any unreadable child is skipped silently. Symlinks are
+    not followed (the staged dir never contains them in practice and we'd
+    rather under-count than escape the data root).
+    """
+    if not path.exists():
+        return None
+    total = 0
+    try:
+        for entry in path.rglob("*"):
+            try:
+                if entry.is_file() and not entry.is_symlink():
+                    total += entry.stat().st_size
+            except OSError:
+                continue
+    except OSError:
+        return None
+    return total
+
+
+def _to_read(dep: Deployment, *, with_disk: bool = False) -> DeploymentRead:
     out = DeploymentRead.model_validate(dep)
     out.url = f"/api/deployments/{dep.id}/predict"
+    if with_disk:
+        out.disk_bytes = _dir_size_bytes(storage.deployment_dir(dep.id))
     return out
+
+
+async def _stop_container_best_effort(dep: Deployment) -> None:
+    """Stop + remove the serving container if one exists. Logs and
+    swallows transport errors — a stale container shouldn't block the
+    state transition that brought us here (trash, restore, purge)."""
+    if not dep.container_id:
+        return
+    from aipacken.docker_client.builder_client import get_builder_client
+
+    try:
+        await get_builder_client().stop(dep.container_id, timeout=10)
+    except (httpx.HTTPError, OSError) as exc:
+        _log.warning(
+            "deployment.stop_failed",
+            deployment_id=dep.id,
+            container_id=dep.container_id,
+            error=str(exc),
+        )
 
 
 @router.post("", response_model=DeploymentRead, status_code=201)
@@ -115,20 +164,34 @@ async def create_deployment(
 
 @router.get("", response_model=DeploymentList)
 async def list_deployments(
+    trashed: bool = False,
     pagination: Pagination = Depends(pagination_params),
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ) -> DeploymentList:
-    stmt = (
-        scope_deployment_by_user(select(Deployment), user)
-        .order_by(Deployment.created_at.desc())
-        .limit(pagination.limit)
-        .offset(pagination.offset)
-    )
-    count_stmt = scope_deployment_by_user(select(func.count(Deployment.id)), user)
+    """List deployments. ``trashed=false`` (default) returns active rows;
+    ``trashed=true`` returns the Trash view (soft-deleted, awaiting
+    restore or hard purge). The Trash view also computes per-row disk
+    footprint so the UI can show how much disk a purge would free."""
+    base = scope_deployment_by_user(select(Deployment), user)
+    count_base = scope_deployment_by_user(select(func.count(Deployment.id)), user)
+    if trashed:
+        base = base.where(Deployment.trashed_at.is_not(None)).order_by(
+            Deployment.trashed_at.desc()
+        )
+        count_base = count_base.where(Deployment.trashed_at.is_not(None))
+    else:
+        base = base.where(Deployment.trashed_at.is_(None)).order_by(
+            Deployment.created_at.desc()
+        )
+        count_base = count_base.where(Deployment.trashed_at.is_(None))
+
+    stmt = base.limit(pagination.limit).offset(pagination.offset)
     rows = (await db.execute(stmt)).scalars().all()
-    total = (await db.execute(count_stmt)).scalar_one()
-    return DeploymentList(items=[_to_read(r) for r in rows], total=total)
+    total = (await db.execute(count_base)).scalar_one()
+    return DeploymentList(
+        items=[_to_read(r, with_disk=trashed) for r in rows], total=total
+    )
 
 
 @router.get("/{deployment_id}", response_model=DeploymentRead)
@@ -138,7 +201,10 @@ async def get_deployment(
     db: AsyncSession = Depends(get_db),
 ) -> DeploymentRead:
     dep = await get_owned_deployment(db, deployment_id, user)
-    return _to_read(dep)
+    # Compute disk footprint only when it matters (the row is in trash and
+    # the UI is about to offer a "Delete forever / X MB" button). Active
+    # rows skip the rglob to keep the detail endpoint cheap.
+    return _to_read(dep, with_disk=dep.trashed_at is not None)
 
 
 @router.patch("/{deployment_id}", response_model=DeploymentRead)
@@ -167,27 +233,103 @@ async def delete_deployment(
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ) -> Response:
-    """Stop the serving container (best-effort) and remove the row."""
+    """Move a deployment to Trash.
+
+    Stops the serving container (best-effort), syncs Traefik so the route
+    is freed immediately, and flips ``trashed_at``. The DB row and the
+    staged artifacts dir under ``/var/platform-data/deployments/{id}/``
+    are preserved so Restore can re-deploy without re-staging from MLflow.
+
+    To wipe disk + row, the client follows up with ``DELETE /{id}/purge``
+    from the Trash view.
+    """
+    from aipacken.docker_client.traefik_sync import sync_model_routes
+
     dep = await get_owned_deployment(db, deployment_id, user)
+    if dep.trashed_at is not None:
+        # Already trashed — make the operation idempotent so a double-click
+        # or a retry from a flaky network doesn't 404 the second time.
+        return Response(status_code=204)
 
-    if dep.container_id:
-        import structlog
-        from httpx import HTTPError
+    await _stop_container_best_effort(dep)
 
-        from aipacken.docker_client.builder_client import get_builder_client
+    dep.status = "trashed"
+    dep.trashed_at = datetime.now(UTC)
+    dep.container_id = None
+    dep.internal_url = None
+    await db.commit()
 
-        _log = structlog.get_logger(__name__)
-        try:
-            await get_builder_client().stop(dep.container_id, timeout=10)
-        except (HTTPError, OSError) as exc:
-            _log.warning(
-                "deployment.delete.stop_failed",
-                deployment_id=dep.id,
-                container_id=dep.container_id,
-                error=str(exc),
-            )
-            # Stale container may already be gone; don't block the delete on it.
-            pass
+    try:
+        await sync_model_routes(db)
+    except Exception:
+        _log.exception("deployment.trash.traefik_sync_failed", deployment_id=dep.id)
+    await publish(
+        f"deployment:{dep.id}:events", {"status": "trashed"}
+    )
+    return Response(status_code=204)
+
+
+@router.post("/{deployment_id}/restore", response_model=DeploymentRead)
+async def restore_deployment(
+    deployment_id: str,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> DeploymentRead:
+    """Bring a trashed deployment back online.
+
+    Clears ``trashed_at`` and re-enqueues ``deploy_model``. The worker is
+    idempotent: if the staged dir is still present it'll reuse it; if it
+    was hand-cleaned (or the dir was never staged), it'll re-pull from
+    MLflow. Either way the user gets back a running container under the
+    same slug, which means the same Traefik route.
+    """
+    dep = await get_owned_deployment(db, deployment_id, user)
+    if dep.trashed_at is None:
+        raise HTTPException(status_code=409, detail="deployment_not_trashed")
+
+    dep.trashed_at = None
+    dep.status = "pending"
+    await db.commit()
+    await db.refresh(dep)
+    await enqueue("deploy_model", dep.id)
+    return _to_read(dep)
+
+
+@router.delete("/{deployment_id}/purge", status_code=204, response_class=Response)
+async def purge_deployment(
+    deployment_id: str,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> Response:
+    """Hard-delete a trashed deployment: wipe staged artifacts + row.
+
+    Refuses to purge an active deployment — Trash is a deliberate two-step
+    so a stray click can't take down a serving container *and* erase the
+    artifacts behind it in a single request.
+    """
+    dep = await get_owned_deployment(db, deployment_id, user)
+    if dep.trashed_at is None:
+        raise HTTPException(status_code=409, detail="deployment_must_be_trashed_first")
+
+    # Defensive: if a redeploy raced past the trashed_at check (shouldn't
+    # happen, but a queued deploy_model could have flipped container_id
+    # while the row was trashed by a concurrent request), make sure the
+    # container is gone before we drop the row. Best-effort.
+    await _stop_container_best_effort(dep)
+
+    staged = storage.deployment_dir(dep.id)
+    try:
+        shutil.rmtree(staged, ignore_errors=True)
+    except OSError as exc:
+        # ignore_errors=True catches almost everything, but rmtree itself
+        # can raise on racy fs unmounts. Log and continue — leaving the
+        # row alive while the dir lingers is worse than the inverse.
+        _log.warning(
+            "deployment.purge.rmtree_failed",
+            deployment_id=dep.id,
+            path=str(staged),
+            error=str(exc),
+        )
 
     await db.delete(dep)
     await db.commit()

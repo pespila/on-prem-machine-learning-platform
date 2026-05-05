@@ -171,6 +171,11 @@ class Deployment(Base, IdMixin, TimestampsMixin):
     api_key_hash: Mapped[str | None] = mapped_column(String(255), nullable=True)
     audit_payloads: Mapped[bool] = mapped_column(default=False, nullable=False)
     last_health_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    # Soft-delete marker. NULL = active. NOT NULL = the row is in Trash:
+    # the container has been stopped + Traefik route freed, but the staged
+    # artifacts dir is kept on disk so Restore can re-deploy without
+    # re-staging from MLflow. Hard purge wipes the dir + row.
+    trashed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
 
 class Prediction(Base, IdMixin):

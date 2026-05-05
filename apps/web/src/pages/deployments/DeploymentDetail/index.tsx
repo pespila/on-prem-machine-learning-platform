@@ -1,4 +1,5 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { RotateCcw, Trash2 } from "lucide-react";
 import { useState } from "react";
 import { useNavigate, useParams } from "react-router-dom";
 
@@ -8,6 +9,7 @@ import { GlassCard } from "@/components/molecules/GlassCard";
 import { useT } from "@/i18n";
 import { api, type DeploymentRead } from "@/lib/api/client";
 import { cn } from "@/lib/cn";
+import { formatBytes, formatRelative } from "@/lib/format";
 
 import { LogsTab } from "./LogsTab";
 import { OverviewTab } from "./OverviewTab";
@@ -30,6 +32,7 @@ function mapStatus(status: DeploymentRead["status"]): RunStatus {
     case "stopping":
     case "stopped":
     case "tearing_down":
+    case "trashed":
       return "cancelled";
     default:
       return "queued";
@@ -66,6 +69,23 @@ export function DeploymentDetail() {
     },
   });
 
+  const restore = useMutation({
+    mutationFn: () => api.deployments.restore(id),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ["deployments"] });
+    },
+  });
+
+  const purge = useMutation({
+    mutationFn: () => api.deployments.purge(id),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ["deployments"] });
+      navigate("/deployments");
+    },
+  });
+
+  const isTrashed = Boolean(deployment.data?.trashed_at);
+
   const tabs: Array<{ key: Tab; label: string }> = [
     { key: "overview", label: t("deployments.tabs.overview") },
     { key: "test", label: t("deployments.tabs.test") },
@@ -86,14 +106,64 @@ export function DeploymentDetail() {
             onSave={async (next) => {
               await rename.mutateAsync(next);
             }}
-            onDelete={async () => {
-              await remove.mutateAsync();
-            }}
-            deleteConfirm="Delete this deployment? The serving container will be stopped immediately."
+            // EditableHeading owns its delete confirm — disable it when the
+            // row is already trashed so the trash banner below is the only
+            // path to "Delete forever". (Avoids two competing destructive
+            // affordances on one screen.)
+            onDelete={
+              isTrashed
+                ? undefined
+                : async () => {
+                    await remove.mutateAsync();
+                  }
+            }
+            deleteConfirm="Move this deployment to Trash? The container is stopped and the route freed; the staged artifacts stay on disk so you can restore later."
             saving={rename.isPending}
             deleting={remove.isPending}
           />
         </div>
+        {isTrashed && deployment.data ? (
+          <div className="flex flex-col gap-3 rounded-lg border border-[color:var(--border)] bg-bg-muted/40 p-4 sm:flex-row sm:items-center sm:justify-between">
+            <div className="text-sm text-fg2">
+              <div className="font-semibold text-fg1">In Trash</div>
+              <div className="mt-0.5 text-xs">
+                Trashed {formatRelative(deployment.data.trashed_at)}
+                {deployment.data.disk_bytes != null
+                  ? ` · ${formatBytes(deployment.data.disk_bytes)} on disk`
+                  : ""}
+              </div>
+            </div>
+            <div className="flex items-center gap-2">
+              <button
+                type="button"
+                onClick={() => restore.mutate()}
+                disabled={restore.isPending}
+                className="inline-flex items-center gap-1.5 rounded-md border border-[color:var(--border)] bg-bg px-3 py-1.5 text-xs font-semibold text-fg1 transition hover:border-primary hover:bg-[color:var(--primary-soft)] disabled:opacity-50"
+              >
+                <RotateCcw size={13} strokeWidth={2} />
+                {restore.isPending ? "Restoring…" : "Restore"}
+              </button>
+              <button
+                type="button"
+                onClick={() => {
+                  const size = formatBytes(deployment.data?.disk_bytes ?? 0);
+                  if (
+                    confirm(
+                      `Delete "${deployment.data?.name}" forever? This wipes the staged artifacts (${size}) and the database row. Cannot be undone.`,
+                    )
+                  ) {
+                    purge.mutate();
+                  }
+                }}
+                disabled={purge.isPending}
+                className="inline-flex items-center gap-1.5 rounded-md border border-[color:var(--border)] bg-bg px-3 py-1.5 text-xs font-semibold text-danger transition hover:border-danger hover:bg-[color:var(--danger-soft,rgba(255,90,90,0.08))] disabled:opacity-50"
+              >
+                <Trash2 size={13} strokeWidth={2} />
+                {purge.isPending ? "Deleting…" : "Delete forever"}
+              </button>
+            </div>
+          </div>
+        ) : null}
       </header>
 
       <div

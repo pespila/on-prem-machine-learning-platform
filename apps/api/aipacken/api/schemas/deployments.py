@@ -53,11 +53,19 @@ class DeploymentRead(BaseModel):
     last_health_at: datetime | None = None
     created_at: datetime
     updated_at: datetime
+    # NULL → active. NOT NULL → moved to Trash (container stopped, route
+    # freed). The hard purge endpoint wipes the row + staged dir.
+    trashed_at: datetime | None = None
 
     # UI-facing convenience field: the public URL external callers POST to.
     # Populated by the router; not stored on the table.
     url: str = ""
     last_called_at: datetime | None = None
+    # Bytes occupied by the staged artifacts dir under
+    # /var/platform-data/deployments/{id}/. Populated only on the trashed
+    # listing and on the trashed detail view — du-style scan, skipped for
+    # active rows where the value would just be operational noise.
+    disk_bytes: int | None = None
 
 
 class DeploymentList(BaseModel):

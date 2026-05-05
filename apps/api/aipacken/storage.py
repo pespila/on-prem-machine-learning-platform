@@ -89,6 +89,15 @@ def run_dir(run_id: str) -> Path:
     return _root() / "runs" / run_id
 
 
+def deployment_dir(deployment_id: str) -> Path:
+    """Staged-artifacts directory for a deployment.
+
+    Single source of truth shared by ``deploy_model`` (which writes here)
+    and the trash/purge endpoints (which size + delete it).
+    """
+    return _root() / "deployments" / deployment_id
+
+
 def run_artifacts_dir(run_id: str) -> Path:
     return run_dir(run_id) / "artifacts"
 

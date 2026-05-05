@@ -282,7 +282,8 @@ export type DeploymentStatus =
   | "failed"
   | "stopping"
   | "tearing_down"
-  | "stopped";
+  | "stopped"
+  | "trashed";
 
 export type ModelPackageStatus = "pending" | "building" | "ready" | "failed";
 
@@ -315,6 +316,13 @@ export interface DeploymentRead {
   internal_url: string | null;
   created_at: string;
   last_called_at: string | null;
+  /** ISO-8601 timestamp when the row was moved to Trash, or null if active. */
+  trashed_at: string | null;
+  /**
+   * Bytes occupied by the staged artifacts dir. Server-populated only on
+   * the Trash listing and on the trashed detail view; null otherwise.
+   */
+  disk_bytes: number | null;
 }
 
 export interface PredictionResponse {
@@ -566,8 +574,10 @@ export const api = {
   },
 
   deployments: {
-    list: () =>
-      apiFetch<{ items: DeploymentRead[] }>("/deployments").then((r) => r.items ?? []),
+    list: (opts?: { trashed?: boolean }) =>
+      apiFetch<{ items: DeploymentRead[] }>(
+        opts?.trashed ? "/deployments?trashed=true" : "/deployments",
+      ).then((r) => r.items ?? []),
     get: (id: string) => apiFetch<DeploymentRead>(`/deployments/${encodeURIComponent(id)}`),
     create: (input: CreateDeploymentInput) =>
       apiFetch<DeploymentRead>("/deployments", { method: "POST", body: input }),
@@ -576,8 +586,17 @@ export const api = {
         method: "PATCH",
         body: input,
       }),
+    /** Soft-delete: move to Trash. Container is stopped, route freed, row kept. */
     remove: (id: string) =>
       apiFetch<void>(`/deployments/${encodeURIComponent(id)}`, { method: "DELETE" }),
+    /** Bring a trashed deployment back online by re-enqueuing deploy_model. */
+    restore: (id: string) =>
+      apiFetch<DeploymentRead>(`/deployments/${encodeURIComponent(id)}/restore`, {
+        method: "POST",
+      }),
+    /** Hard-delete: wipe the staged-artifacts dir and the DB row. Trash-only. */
+    purge: (id: string) =>
+      apiFetch<void>(`/deployments/${encodeURIComponent(id)}/purge`, { method: "DELETE" }),
     schema: (id: string) =>
       apiFetch<JsonSchema>(`/deployments/${encodeURIComponent(id)}/schema`),
     logs: (id: string, tail: number = 500) =>

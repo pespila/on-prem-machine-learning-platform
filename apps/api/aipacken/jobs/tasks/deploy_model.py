@@ -30,11 +30,6 @@ from aipacken.services.redis_client import publish
 logger = structlog.get_logger(__name__)
 
 
-def _deployment_dir(deployment_id: str) -> Path:
-    """Absolute path to this deployment's staged artifacts directory."""
-    return storage.data_root() / "deployments" / deployment_id
-
-
 def _stage_artifacts(
     deployment_id: str,
     platform_run_id: str,
@@ -49,7 +44,7 @@ def _stage_artifacts(
         deployments router's /schema endpoint can serve it without a
         disk read or a live probe.
     """
-    dst = _deployment_dir(deployment_id)
+    dst = storage.deployment_dir(deployment_id)
     dst.mkdir(parents=True, exist_ok=True)
 
     # ``artifact_path="artifacts"`` pulls the whole subtree in one shot;
@@ -177,7 +172,7 @@ async def deploy_model(ctx: dict[str, Any], deployment_id: str) -> dict[str, Any
             dep.status = "failed"
             # Best-effort clean-up of the staged dir so a retry starts fresh.
             try:
-                shutil.rmtree(_deployment_dir(dep.id), ignore_errors=True)
+                shutil.rmtree(storage.deployment_dir(dep.id), ignore_errors=True)
             except OSError as cleanup_exc:
                 logger.info(
                     "deploy_model.cleanup_failed",
