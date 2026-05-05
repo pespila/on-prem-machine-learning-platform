@@ -58,9 +58,14 @@ export function RunDetail() {
     queryFn: () => api.runs.metrics(id),
     enabled: Boolean(id),
     // AutoGluon / HPO can stream per-step metrics during `running`, so we
-    // poll then. Nothing to see during `queued`; stop once terminal.
-    refetchInterval: () => {
-      if (isQueued || isTerminal) return false;
+    // poll then. Nothing to see during `queued`. After terminal, MLflow may
+    // still be flushing the final batch; keep polling fast until data shows
+    // up so the user doesn't have to refresh to see metrics + the chart.
+    refetchInterval: (q) => {
+      if (isQueued) return false;
+      if (isTerminal) {
+        return (q.state.data?.length ?? 0) > 0 ? false : 3_000;
+      }
       return 5_000;
     },
   });

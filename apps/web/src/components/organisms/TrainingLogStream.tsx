@@ -50,6 +50,7 @@ export function TrainingLogStream({
   const [lines, setLines] = useState<LogLine[]>(history ?? []);
   const [filter, setFilter] = useState("");
   const scrollRef = useRef<HTMLDivElement>(null);
+  const seededRef = useRef(false);
   const events = useMemo(() => [eventName] as const, [eventName]);
 
   const { connectionState } = useEventSource<LogLine>({
@@ -64,18 +65,41 @@ export function TrainingLogStream({
     },
   });
 
-  // Refill the transcript when history arrives/changes. Replaces rather than
-  // appends — persisted logs are authoritative for what happened before the
-  // SSE connection opened, and duplicates from a reconnect would be confusing.
-  // Once SSE is live, ignore further history updates — the stream is
-  // authoritative and a polled history array is recreated every 5s, which
-  // otherwise re-mounts the log list on every tick.
+  // Reset the seed flag and the buffer when the stream target changes so a
+  // navigation between runs/deployments without an unmount still picks up
+  // the new history.
   useEffect(() => {
-    if (connectionState === "live") return;
-    if (history && history.length > 0) {
-      setLines(history.slice(-maxLines));
-    }
-  }, [history, maxLines, connectionState]);
+    seededRef.current = false;
+    setLines([]);
+  }, [url]);
+
+  // Reconcile the buffer with the polled history.
+  //
+  // Earlier the gate was `connectionState !== "live"`, but SSE often goes
+  // live *before* the history fetch resolves, so a refresh on a finished
+  // run — or on a deployment, where SSE carries only status pings, never
+  // log content — left the panel permanently empty.
+  //
+  // Two cases need to coexist:
+  //   1. Run logs: SSE streams log lines. Seed once from history, then let
+  //      SSE append. Don't clobber on later polls (our buffer is ahead).
+  //   2. Deployment logs: history is the only source and grows over time.
+  //      Replace whenever the server has more lines than we have buffered.
+  // Comparing lengths covers both: SSE-driven buffer stays >= history;
+  // poll-driven buffer trails history and gets refreshed.
+  useEffect(() => {
+    if (!history || history.length === 0) return;
+    setLines((current) => {
+      if (!seededRef.current) {
+        seededRef.current = true;
+        return history.slice(-maxLines);
+      }
+      if (history.length > current.length) {
+        return history.slice(-maxLines);
+      }
+      return current;
+    });
+  }, [history, maxLines]);
 
   const filtered = useMemo(() => {
     if (!filter.trim()) return lines;
