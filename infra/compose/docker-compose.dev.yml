@@ -42,3 +42,19 @@ services:
     volumes:
       - ../../apps/web:/app
       - /app/node_modules
+    # Base compose caps memory at 128M for the prod nginx target. Vite +
+    # esbuild need far more — OOM-kills the esbuild child with the cryptic
+    # "Error: The service was stopped".
+    # Prod healthcheck looks for /var/run/nginx.pid — never exists in
+    # the Vite dev target, so the container is forever "unhealthy".
+    healthcheck:
+      test: ["CMD-SHELL", "node -e \"require('http').get('http://127.0.0.1:80/',r=>process.exit(r.statusCode<500?0:1)).on('error',()=>process.exit(1))\""]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+    deploy:
+      resources:
+        limits:
+          cpus: "2.0"
+          memory: 2G
