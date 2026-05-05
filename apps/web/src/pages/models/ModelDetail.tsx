@@ -5,7 +5,7 @@ import { Link, useNavigate, useParams } from "react-router-dom";
 
 import { EditableHeading } from "@/components/molecules/EditableHeading";
 import { GlassCard } from "@/components/molecules/GlassCard";
-import { api, errorMessage, type ModelPackageRead } from "@/lib/api/client";
+import { api, errorMessage, type ModelPackageRead, type ModelVersionRead } from "@/lib/api/client";
 import { formatNumber, formatRelative } from "@/lib/format";
 
 function formatHpValue(value: unknown): string {
@@ -122,9 +122,22 @@ export function ModelDetail() {
 
   const rename = useMutation({
     mutationFn: (name: string) => api.models.update(id, { name }),
-    onSuccess: () => {
-      qc.invalidateQueries({ queryKey: ["models", id] });
+    onSuccess: (updated) => {
+      // The model's id IS its name, so a rename changes the route param.
+      // Carry the previous detail (with versions[]) over to the new key so
+      // the page renders instantly without a "Loading…" flash, drop the
+      // now-404 old key, and swap the URL — otherwise the detail page keeps
+      // refetching the old name and flashes red errors until the user
+      // reopens it from the list. The PATCH response only carries
+      // {id,name,description}, hence the merge.
+      const nextId = updated.id;
+      const prev = qc.getQueryData<{ versions?: ModelVersionRead[] }>(["models", id]);
+      qc.setQueryData(["models", nextId], { ...prev, ...updated });
+      qc.removeQueries({ queryKey: ["models", id], exact: true });
       qc.invalidateQueries({ queryKey: ["models"] });
+      if (nextId !== id) {
+        navigate(`/models/${encodeURIComponent(nextId)}`, { replace: true });
+      }
     },
   });
 
