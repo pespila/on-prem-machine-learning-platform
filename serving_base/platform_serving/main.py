@@ -16,7 +16,7 @@ import pandas as pd
 import structlog
 from fastapi import FastAPI, File, HTTPException, Request, UploadFile
 from fastapi.responses import JSONResponse, StreamingResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict
 
 from platform_serving import __version__
 from platform_serving.batch import iter_chunks
@@ -36,6 +36,10 @@ log = structlog.get_logger("serving")
 
 
 class PredictResponse(BaseModel):
+    # `model_version` collides with Pydantic v2's reserved `model_` prefix;
+    # opt out explicitly so container start-up doesn't spam a UserWarning.
+    model_config = ConfigDict(protected_namespaces=())
+
     prediction: Any
     prediction_label: str | None = None
     target_classes: list[str] | None = None
